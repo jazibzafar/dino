@@ -31,8 +31,10 @@ from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 
 import utils
+from dino_utils import DINOTransform, GeoWebDataset
 import vision_transformer as vits
 from vision_transformer import DINOHead
+from torch.utils.tensorboard import SummaryWriter
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -52,6 +54,7 @@ def get_args_parser():
         values leads to better performance but requires more memory. Applies only
         for ViTs (vit_tiny, vit_small and vit_base). If <16, we recommend disabling
         mixed precision training (--use_fp16 false) to avoid unstabilities.""")
+    parser.add_argument('--in_chan', default=4, type=int, help="""Number of color channels in the input image.""")
     parser.add_argument('--out_dim', default=65536, type=int, help="""Dimensionality of
         the DINO head output. For complex and large datasets large values (like 65k) work well.""")
     parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag,
@@ -105,10 +108,14 @@ def get_args_parser():
     parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
 
     # Multi-crop parameters
+    parser.add_argument('--global_crop_size', type=int, default=224,
+        help="""Size of the global crop. In paper, its 224.""")
     parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""")
+    parser.add_argument('--local_crop_size', type=int, default=96,
+        help="""Size of the global crop. In paper, its 96.""")
     parser.add_argument('--local_crops_number', type=int, default=8, help="""Number of small
         local views to generate. Set this parameter to 0 to disable multi-crop training.
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """)
@@ -125,6 +132,7 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
+    parser.add_argument("--world_size", default=1, type=int, help="world size.")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
@@ -137,22 +145,42 @@ def train_dino(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    transform = DataAugmentationDINO(
-        args.global_crops_scale,
-        args.local_crops_scale,
-        args.local_crops_number,
+    # transform = DataAugmentationDINO(
+    #     args.global_crops_scale,
+    #     args.local_crops_scale,
+    #     args.local_crops_number,
+    # )
+    transform = DINOTransform(
+        global_crop_size=args.global_crop_size,
+        global_crops_scale=args.global_crops_scale,
+        local_crop_size=args.local_crop_size,
+        local_crops_scale=args.local_crops_scale,
+        local_crops_number=args.local_crops_number
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+
+    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    dataset = GeoWebDataset(
+        root=args.data_path,
+        n_bands=args.in_chan,
+        augmentations=transform,
+    )
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
-        sampler=sampler,
+        # sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
     )
+    # log_writer = SummaryWriter(log_dir=args.output_dir)
     print(f"Data loaded: there are {len(dataset)} images.")
+    # Devices to check if torch is indeed using cuda.
+    print("GPU/CUDA summary")
+    print(f"Device is available: {torch.cuda.is_available()}")
+    print(f"Device count: {torch.cuda.device_count()}")
+    print(f"Current device: {torch.cuda.current_device()}")
+    print(f"Device name: {torch.cuda.get_device_name(0)}")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -162,8 +190,9 @@ def train_dino(args):
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
+            in_chans=args.in_chan
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
+        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, in_chans=args.in_chan)
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -267,7 +296,7 @@ def train_dino(args):
     start_time = time.time()
     print("Starting DINO training !")
     for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
+        # data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
@@ -303,7 +332,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    # for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, images in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -416,52 +446,52 @@ class DINOLoss(nn.Module):
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
-class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
-        flip_and_color_jitter = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply(
-                [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
-                p=0.8
-            ),
-            transforms.RandomGrayscale(p=0.2),
-        ])
-        normalize = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ])
-
-        # first global crop
-        self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            utils.GaussianBlur(1.0),
-            normalize,
-        ])
-        # second global crop
-        self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            utils.GaussianBlur(0.1),
-            utils.Solarization(0.2),
-            normalize,
-        ])
-        # transformation for the local small crops
-        self.local_crops_number = local_crops_number
-        self.local_transfo = transforms.Compose([
-            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            utils.GaussianBlur(p=0.5),
-            normalize,
-        ])
-
-    def __call__(self, image):
-        crops = []
-        crops.append(self.global_transfo1(image))
-        crops.append(self.global_transfo2(image))
-        for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
-        return crops
+# class DataAugmentationDINO(object):
+#     def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+#         flip_and_color_jitter = transforms.Compose([
+#             transforms.RandomHorizontalFlip(p=0.5),
+#             transforms.RandomApply(
+#                 [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+#                 p=0.8
+#             ),
+#             transforms.RandomGrayscale(p=0.2),
+#         ])
+#         normalize = transforms.Compose([
+#             transforms.ToTensor(),
+#             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+#         ])
+#
+#         # first global crop
+#         self.global_transfo1 = transforms.Compose([
+#             transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+#             flip_and_color_jitter,
+#             utils.GaussianBlur(1.0),
+#             normalize,
+#         ])
+#         # second global crop
+#         self.global_transfo2 = transforms.Compose([
+#             transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+#             flip_and_color_jitter,
+#             utils.GaussianBlur(0.1),
+#             utils.Solarization(0.2),
+#             normalize,
+#         ])
+#         # transformation for the local small crops
+#         self.local_crops_number = local_crops_number
+#         self.local_transfo = transforms.Compose([
+#             transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
+#             flip_and_color_jitter,
+#             utils.GaussianBlur(p=0.5),
+#             normalize,
+#         ])
+#
+#     def __call__(self, image):
+#         crops = []
+#         crops.append(self.global_transfo1(image))
+#         crops.append(self.global_transfo2(image))
+#         for _ in range(self.local_crops_number):
+#             crops.append(self.local_transfo(image))
+#         return crops
 
 
 if __name__ == '__main__':
