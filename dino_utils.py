@@ -98,7 +98,7 @@ class DINOTransform:
         crops = [self.global_transform_1(image=image)['image'], self.global_transform_2(image=image)['image']]
         for _ in range(self.local_crops_number):
             crops.append(self.local_transform(image=image)['image'])
-        crops = [ToTensor()(crop) for crop in crops]
+        # crops = [ToTensor()(crop) for crop in crops]
         return crops
 
 
@@ -157,7 +157,7 @@ class GeoWebDataset(IterableDataset):
                  n_bands,
                  augmentations,
                  num_nodes=1,
-                 num_shards=100,
+                 num_shards=1,
                  imgs_per_shard=250):
         self.root = root
         self.n_bands = n_bands
