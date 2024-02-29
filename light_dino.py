@@ -20,6 +20,7 @@ from dino_utils import DINOTransform, GeoWebDataset
 # TODO: add support for torch compile
 # TODO: add support for only training steps eliminate epochs altogether
 # TODO: DDP support
+# TODO: add resume support
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
@@ -63,7 +64,7 @@ def get_args_parser():
         to use half precision for training. Improves training time and memory requirements,
         but can provoke instability and slight decay of performance. We recommend disabling
         mixed precision if the loss is unstable, if reducing the patch size or if training with bigger ViTs.""")
-    parser.add_argument('--weight_decay', type=float, default=0.04, help="""Initial value of the
+    parser.add_argument('--weight_decay_init', type=float, default=0.04, help="""Initial value of the
         weight decay. With ViT, a smaller value at the beginning of training works well.""")
     parser.add_argument('--weight_decay_end', type=float, default=0.4, help="""Final value of the
         weight decay. We use a cosine schedule for WD and using a larger decay by
@@ -168,8 +169,9 @@ class DINOLoss(nn.Module):
         Update center used for teacher output.
         """
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
-        dist.all_reduce(batch_center)
-        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+        # TODO: When doing distributed don't forget to fix this thing.
+        # dist.all_reduce(batch_center)
+        # batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
@@ -204,7 +206,8 @@ class LitDINO(L.LightningModule):
         self.teacher = MultiCropWrapper(teacher_backbone, teacher_head)
 
         # disable gradients for teacher
-        for p in self.teacher.parameters(): p.requires_grad(False)
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
 
         # ======= initialize the loss =======#
         self.loss = DINOLoss(args.out_dim,
@@ -218,7 +221,7 @@ class LitDINO(L.LightningModule):
         # alternatively, this could be in setup method
         dino_transform = DINOTransform(args.global_crop_size,
                                        args.global_crops_scale,
-                                       args.local_crops_size,
+                                       args.local_crop_size,
                                        args.local_crops_scale,
                                        args.local_crops_number)
         self.dataset = GeoWebDataset(root=args.data_path,
@@ -238,26 +241,28 @@ class LitDINO(L.LightningModule):
         param_groups = [{'params': regularized},
                         {'params': not_regularized, 'weight_decay': 0.}]  # weight decay is 0 because of the scheduler
 
-        self.lr = args.lr * (args.batch_size * args.num_gpus / 256)
+        self.lr = args.lr * (args.batch_size_per_gpu * args.world_size / 256)
         opt = torch.optim.AdamW(param_groups, self.lr)
         return opt
 
     def train_dataloader(self):
-        self.loader = DataLoader(self.dataset,
+        loader = DataLoader(self.dataset,
                                  num_workers=args.num_workers,
-                                 batch_size=args.batchsize,
+                                 batch_size=args.batch_size_per_gpu,
                                  pin_memory=True,
                                  drop_last=True, )
 
-        iterations_per_epoch = len(self.loader)
-        self.lr_sch = cosine_scheduler(self.lr, 1e-6, args.num_epochs, iterations_per_epoch // args.num_gpus,
+
+        iterations_per_epoch = len(loader)
+        self.lr_sch = cosine_scheduler(self.lr, 1e-6, args.epochs, iterations_per_epoch // args.world_size,
                                        args.warmup_epochs)
         # weight decay scheduler
         self.wd_sch = cosine_scheduler(args.weight_decay_init, args.weight_decay_end,
-                                       args.num_epochs, iterations_per_epoch // args.num_gpus)
+                                       args.epochs, iterations_per_epoch // args.world_size)
         # momentum scheduler
         self.mm_sch = cosine_scheduler(args.momentum_teacher, 1.0,
-                                       args.num_epochs, iterations_per_epoch // args.num_gpus)
+                                       args.epochs, iterations_per_epoch // args.world_size)
+        return loader
 
     def training_step(self, batch):
         opt = self.optimizers()
@@ -280,7 +285,7 @@ class LitDINO(L.LightningModule):
         if args.clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(self.student.parameters(), args.clip_grad)
         # cancel gradient for the first epochs
-        if self.current_epoch < args.ep_freeze_last_layer:
+        if self.current_epoch < args.freeze_last_layer:
             for n, p in self.student.named_parameters():
                 if "last_layer" in n:
                     p.grad = None
@@ -301,7 +306,7 @@ def main(args):
     dino = LitDINO(args)
 
     checkpoint_callback = ModelCheckpoint(dirpath=args.output_dir,
-                                          every_n_epochs=5,
+                                          every_n_epochs=args.saveckp_freq,
                                           save_last=True)
 
     logger = TensorBoardLogger(save_dir=args.output_dir,
@@ -313,15 +318,16 @@ def main(args):
                         default_root_dir=args.output_dir,
                         enable_progress_bar=True,
                         logger=logger,
-                        precision="bf16-mixed",
+                        # precision="bf16-mixed",
                         callbacks=[checkpoint_callback])
 
     print("beginning the training.")
     start = time.time()
-    if args.resume:
-        trainer.fit(model=dino, ckpt_path=args.resume)
-    else:
-        trainer.fit(model=dino)
+    # if args.resume:
+    #     trainer.fit(model=dino, ckpt_path=args.resume)
+    # else:
+    #     trainer.fit(model=dino)
+    trainer.fit(model=dino)
     end = time.time()
     print(f"training completed. Elapsed time {end - start} seconds.")
 

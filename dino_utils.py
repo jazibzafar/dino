@@ -98,7 +98,7 @@ class DINOTransform:
         crops = [self.global_transform_1(image=image)['image'], self.global_transform_2(image=image)['image']]
         for _ in range(self.local_crops_number):
             crops.append(self.local_transform(image=image)['image'])
-        # crops = [ToTensor()(crop) for crop in crops]
+        crops = [ToTensor()(crop) for crop in crops]
         return crops
 
 
