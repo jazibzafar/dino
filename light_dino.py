@@ -18,7 +18,7 @@ from dino_utils import DINOTransform, GeoWebDataset
 
 
 # TODO: add support for torch compile
-# TODO: add support for only training steps eliminate epochs altogether
+# DONE: add support for only training steps eliminate epochs altogether
 # TODO: DDP support
 # TODO: add resume support
 
@@ -56,8 +56,8 @@ def get_args_parser():
     parser.add_argument('--teacher_temp', default=0.04, type=float, help="""Final value (after linear warmup)
         of the teacher temperature. For most experiments, anything above 0.07 is unstable. We recommend
         starting with the default value of 0.04 and increase this slightly if needed.""")
-    parser.add_argument('--warmup_teacher_temp_epochs', default=0, type=int,
-                        help='Number of warmup epochs for the teacher temperature (Default: 30).')
+    parser.add_argument('--warmup_teacher_temp_steps', default=0, type=int,
+                        help='Number of warmup steps for the teacher temperature (Default: 30).')
 
     # Training/Optimization parameters
     parser.add_argument('--use_fp16', type=utils.bool_flag, default=True, help="""Whether or not
@@ -74,15 +74,16 @@ def get_args_parser():
         help optimization for larger ViT architectures. 0 for disabling.""")
     parser.add_argument('--batch_size_per_gpu', default=64, type=int,
                         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
-    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
-    parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
+    parser.add_argument('--max_steps', default=25000, type=int, help='Number of (gradient) steps of training.')
+    parser.add_argument('--freeze_last_layer', default=1000, type=int, help="""Number of training steps
         during which we keep the output layer fixed. Typically doing so during
-        the first epoch helps training. Try increasing this value if the loss does not decrease.""")
+        the first epoch helps training. Try increasing this value if the loss does not decrease.
+        Also, for this code this has been modified to 1000 steps rather than 1 epoch""")
     parser.add_argument("--lr", default=0.0005, type=float, help="""Learning rate at the end of
         linear warmup (highest LR used during training). The learning rate is linearly scaled
         with the batch size, and specified here for a reference batch size of 256.""")
-    parser.add_argument("--warmup_epochs", default=10, type=int,
-                        help="Number of epochs for the linear learning-rate warm up.")
+    parser.add_argument("--warmup_steps", default=5000, type=int,
+                        help="Number of steps for the linear learning-rate warm up.")
     parser.add_argument('--min_lr', type=float, default=1e-6, help="""Target LR at the
         end of optimization. We use a cosine LR schedule with linear warmup.""")
     parser.add_argument('--optimizer', default='adamw', type=str,
@@ -110,7 +111,9 @@ def get_args_parser():
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
                         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
-    parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
+    # parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
+    parser.add_argument('--resume', default='', type=str,
+                        help='path to checkpoint to restore training. ')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
@@ -120,9 +123,20 @@ def get_args_parser():
     return parser
 
 
+def cosine_scheduler_step_based(base_value, final_value, warmup_iters, total_iters, start_warmup_value=0):
+    warmup_schedule = np.array([])
+    if warmup_iters > 0:
+        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+    iters = np.arange(total_iters - warmup_iters)
+    schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+    schedule = np.concatenate((warmup_schedule, schedule))
+    assert len(schedule) == total_iters
+    return schedule
+
+
 class DINOLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
-                 warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
+                 warmup_teacher_temp_steps, num_steps, student_temp=0.1,
                  center_momentum=0.9):
         super().__init__()
         self.student_temp = student_temp
@@ -133,11 +147,11 @@ class DINOLoss(nn.Module):
         # a too high temperature makes the training instable at the beginning
         self.teacher_temp_schedule = np.concatenate((
             np.linspace(warmup_teacher_temp,
-                        teacher_temp, warmup_teacher_temp_epochs),
-            np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
+                        teacher_temp, warmup_teacher_temp_steps),
+            np.ones(num_steps - warmup_teacher_temp_steps) * teacher_temp
         ))
 
-    def forward(self, student_output, teacher_output, epoch):
+    def forward(self, student_output, teacher_output, step):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
@@ -145,7 +159,7 @@ class DINOLoss(nn.Module):
         student_out = student_out.chunk(self.ncrops)
 
         # teacher centering and sharpening
-        temp = self.teacher_temp_schedule[epoch]
+        temp = self.teacher_temp_schedule[step]
         teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
         teacher_out = teacher_out.detach().chunk(2)
 
@@ -215,8 +229,8 @@ class LitDINO(L.LightningModule):
                              args.local_crops_number + 2,
                              args.warmup_teacher_temp,
                              args.teacher_temp,
-                             args.warmup_teacher_temp_epochs,
-                             args.epochs)
+                             args.warmup_teacher_temp_steps,
+                             args.max_steps)
 
         # ======= create the dataset =======#
         # alternatively, this could be in setup method
@@ -253,16 +267,9 @@ class LitDINO(L.LightningModule):
                                  pin_memory=True,
                                  drop_last=True, )
 
-
-        iterations_per_epoch = len(loader)
-        self.lr_sch = cosine_scheduler(self.lr, 1e-6, args.epochs, iterations_per_epoch // args.world_size,
-                                       args.warmup_epochs)
-        # weight decay scheduler
-        self.wd_sch = cosine_scheduler(args.weight_decay_init, args.weight_decay_end,
-                                       args.epochs, iterations_per_epoch // args.world_size)
-        # momentum scheduler
-        self.mm_sch = cosine_scheduler(args.momentum_teacher, 1.0,
-                                       args.epochs, iterations_per_epoch // args.world_size)
+        self.lr_sch = cosine_scheduler_step_based(self.lr, 1e-6, args.warmup_steps, args.max_steps)
+        self.wd_sch = cosine_scheduler_step_based(args.weight_decay_init, args.weight_decay_end, 0, args.max_steps)
+        self.mm_sch = cosine_scheduler_step_based(args.momentum_teacher, 1.0, 0, args.max_steps)
         return loader
 
     def training_step(self, batch):
@@ -278,22 +285,22 @@ class LitDINO(L.LightningModule):
         # where each tensor has shape [batch, height, width, channel]
         teacher_output = self.teacher(batch[:2])
         student_output = self.student(batch)
-        loss = self.loss(student_output, teacher_output, self.current_epoch)
+        loss = self.loss(student_output, teacher_output, self.global_step)
 
         opt.zero_grad()
         self.manual_backward(loss)
         # clip gradient
         if args.clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(self.student.parameters(), args.clip_grad)
-        # cancel gradient for the first epochs
-        if self.current_epoch < args.freeze_last_layer:
+        # cancel gradient for the freeze_last_layer steps
+        if self.global_step < args.freeze_last_layer:
             for n, p in self.student.named_parameters():
                 if "last_layer" in n:
                     p.grad = None
         opt.step()
 
         # EMA update for the teacher
-        m = self.mm_sch[self.global_step]
+        m = self.mm_sch[self.global_step-1 if self.global_step != 0 else self.global_step]
         for ps, pt in zip(self.student.parameters(), self.teacher.parameters()):
             pt.data.mul_(m).add_((1 - m) * ps.data)
 
@@ -307,7 +314,7 @@ def main(args):
     dino = LitDINO(args)
 
     checkpoint_callback = ModelCheckpoint(dirpath=args.output_dir,
-                                          every_n_epochs=args.saveckp_freq,
+                                          every_n_train_steps=int(args.max_steps/5),
                                           save_last=True)
 
     logger = TensorBoardLogger(save_dir=args.output_dir,
@@ -315,7 +322,7 @@ def main(args):
                                default_hp_metric=False)
 
     trainer = L.Trainer(accelerator='gpu',
-                        max_epochs=args.epochs,
+                        max_steps=args.max_steps,
                         default_root_dir=args.output_dir,
                         enable_progress_bar=True,
                         logger=logger,
@@ -324,11 +331,11 @@ def main(args):
 
     print("beginning the training.")
     start = time.time()
-    # if args.resume:
-    #     trainer.fit(model=dino, ckpt_path=args.resume)
-    # else:
-    #     trainer.fit(model=dino)
-    trainer.fit(model=dino)
+    if args.resume:
+        trainer.fit(model=dino, ckpt_path=args.resume)
+    else:
+        trainer.fit(model=dino)
+    # trainer.fit(model=dino)
     end = time.time()
     print(f"training completed. Elapsed time {end - start} seconds.")
 

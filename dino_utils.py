@@ -1,6 +1,5 @@
 from __future__ import print_function, division
 
-import cv2
 from tifffile import imread
 import albumentations as A
 import torch
@@ -157,7 +156,7 @@ class GeoWebDataset(IterableDataset):
                  n_bands,
                  augmentations,
                  num_nodes=1,
-                 num_shards=1,
+                 num_shards=100,
                  imgs_per_shard=250):
         self.root = root
         self.n_bands = n_bands
