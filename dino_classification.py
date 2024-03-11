@@ -200,9 +200,9 @@ class DINOClassification(L.LightningModule):
         self.manual_backward(loss)
         opt.step()
         self.log('train/lr', self.lr)
-        self.log('train/loss', loss, True)
+        self.log('train/loss', loss)
 
-    def validation_step(self, batch):
+    def validation_step(self, batch, batch_idx):
         samples = batch[0]
         targets = batch[1]
 
