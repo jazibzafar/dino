@@ -34,9 +34,6 @@ def get_args_parser():
                         help="patch size in pixels.")
     parser.add_argument('--num_classes', default=16, type=int,
                         help="number of classes in the dataset.")
-    parser.add_argument('--linear_eval', default=True, action="store_true",
-                        help="true if freeze vit and only train classification layer,"
-                             "false if fine tune the entire network. ")
     parser.add_argument("--lr", default=0.0001, type=float,
                         help="learning rate")
     parser.add_argument('--batch_size_per_gpu', default=64, type=int,
@@ -115,15 +112,11 @@ class DINOClassification(L.LightningModule):
 
         self.args = args
         checkpoint = self.load_checkpoint(self.args.checkpoint_path, self.args.checkpoint_key)
-        model_vit = self.prepare_arch(self.args.arch, checkpoint, self.args.patch_size)
-        linear_classifier = LinearClassifier(model_vit.embed_dim, self.args.num_classes)
+        self.backbone = self.prepare_arch(self.args.arch, checkpoint, self.args.patch_size)
+        self.backbone.eval()
+        self.linear_classifier = LinearClassifier(self.backbone.embed_dim, self.args.num_classes)
 
-        if self.args.linear_eval:
-            model_vit.eval()
-        else:
-            model_vit.train()
-
-        self.model = torch.nn.Sequential(model_vit, linear_classifier)
+        # self.model = torch.nn.Sequential(model_vit, linear_classifier)
         self.train_dataset, self.val_dataset = self.build_dataset(self.args)
         self.train_sampler = RandomSampler(self.train_dataset)
         self.val_sampler = SequentialSampler(self.val_dataset)
@@ -160,7 +153,7 @@ class DINOClassification(L.LightningModule):
 
     def configure_optimizers(self):
         regularized, not_regularized = [], []
-        for n, p in self.model.named_parameters():
+        for n, p in self.linear_classifier.named_parameters():
             if not p.requires_grad:
                 continue
             # we do not regularize biases nor Norm parameters
@@ -209,7 +202,8 @@ class DINOClassification(L.LightningModule):
 
         samples = batch[0]
         targets = batch[1]
-        output = self.model(samples)
+        output_backbone = self.backbone(samples)
+        output = self.linear_classifier(output_backbone)
         loss = self.loss(output, targets)
         opt.zero_grad()
         self.manual_backward(loss)
@@ -222,7 +216,8 @@ class DINOClassification(L.LightningModule):
         samples = batch[0]
         targets = batch[1]
 
-        output = self.model(samples)
+        output_backbone = self.backbone(samples)
+        output = self.linear_classifier(output_backbone)
         loss = self.loss(output, targets)
 
         acc1, acc5 = utils.accuracy(output, targets, topk=(1, 5))

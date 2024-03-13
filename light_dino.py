@@ -20,7 +20,7 @@ from dino_utils import DINOTransform, GeoWebDataset
 # TODO: add support for torch compile
 # DONE: add support for only training steps eliminate epochs altogether
 # TODO: DDP support
-# TODO: add resume support
+# DONE: add resume support
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
